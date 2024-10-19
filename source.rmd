@@ -1,0 +1,172 @@
+---
+title: "MVNBL_jags"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Set options for knitr
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup, include=FALSE}
+# List of required packages
+required_packages <- c("arcgisbinding", "rlang", "tidyverse", "sp", "parzer",
+"stringdist", "birk", "spatialEco", "celestial", "raster", "geosphere", "corrplot",
+"PerformanceAnalytics", "fastDummies", "recipes", "glmnet", "ltm", "MASS", "R2jags", "rsq",
+"lares", "lsr", "corrr", "doBy", "openxlsx", "fitdistrplus", "actuar", "odbc", "RODBC", "Hmisc",
+"knitr", "rmarkdown", "R2WinBUGS", "coda", "readxl", "arm", "extraDistr", "ggplot2",
+"reshape2", "rlist", "magrittr", "readr", "viridis", "patchwork", "Metrics", "berryFunctions", 
+"loo", "bayesmix", "mclust", "e1071", "R.oo", "gmodels", "LindleyR", "stats4", "numDeriv",
+"GA", "parallel", "bayesplot", "doParallel", "optimx", "MCMCvis", "jagsUI", "tmvtnorm",
+"plotMCMC", "MethylCapSig", "seds")
+
+# Install required packages if not already installed
+install_if_missing <- function(pack) {
+  if (!require(pack, character.only = TRUE)) {
+    install.packages(pack)
+    library(pack, character.only = TRUE)
+  }
+}
+
+# Apply the installation function to the list of required packages
+lapply(required_packages, install_if_missing)
+
+# Set the memory limit to handle large datasets
+memory.limit(56000)
+
+# Load the rstan package for Bayesian modeling
+library("rstan")
+```
+
+```{r}
+# Custom log-likelihood function to extract log likelihood from model
+ll <- function(fit) {
+  # Extract log-likelihood values from fitted model object
+  log_lik <- extract(fit, pars = c("log_lik"), permuted = TRUE, inc_warmup = FALSE, include = TRUE) 
+  
+  # Initialize empty array to store log-likelihood values
+  ll <- array(dim = c(N, J))
+  
+  # Calculate mean log-likelihood for each combination of observations and outcomes
+  for (i in 1:N) {
+    for (j in 1:J) {
+      ll[i, j] <- mean(log_lik$log_lik[, i, j])
+    }
+  }
+  
+  return(ll)
+}
+```
+
+```{r}
+# Load the Michigan Intersection Dataset for analysis
+Data <- readxl::read_xlsx("data/Michigan Intersection Data.xlsx", col_names = TRUE, sheet = "Sev")
+
+# Create the response variable (Y) by summing different severity levels of crashes
+Y <- rowSums(Data[c("K", "A", "C", "B", "PDO")]) %>% as.data.frame()
+
+# Select explanatory variables from the dataset
+X <- Data[c("Avg_Maj_entvol", "Avg_Min_entvol", "IntersectionType", "MajRdThru", "MajRdRT", "MajRdLT", "MajRdRec", "MinRdThru", "MinRdRT", "MinRdLT", "MinRdRec", "Skew", "Lighting", "MajRdDriveways", "MinRdDriveways", "MajApproachWithMTA", "MajNearestMTADist", "MajFarthestMTADist", "MinApproachesWithMTA", "MinNearestMTADist", "MinFarthestMTADist", "MajSidewalk", "MinSidewalk", "PedRampCurbCut", "MajRdWidth", "MinRdWidth", "MajRdApproachesWithSL", "ShortestMajRdSL", "MinRdApproachesWithSL", "ShortestMinRdSL", "MajRdBikeLane", "MinRdBikeLane", "MajRdBusStop", "MinRdBusStop", "MajRdParking", "MinRdParking", "MajRdMedian", "MajRdMedianWidth", "MinRdMedian", "MinRdMedianWidth", "PostSecondarySchool", "MajorLegSpeedLimit", "MajorLegOneWayIndicator", "MinorLegOneWayIndicator")] %>% as.data.frame()
+
+# Create new columns for aggregated crash severity data
+Data <- Data %>%
+  mutate(KA = K + A,   # Sum of fatal and serious injury crashes
+         KAB = K + A + B,  # Sum of fatal, serious, and minor injury crashes
+         PDOC = C + PDO,  # Sum of property damage only crashes
+         KABCO = K + A + B + C + PDO)  # Sum of all crash severity levels
+
+# Select variables for analysis and convert to matrix format
+XY <- Data %>% select(Avg_Maj_entvol, Avg_Min_entvol, MinRdWidth, KA, B, C, PDO) %>% as.matrix()
+
+# Remove outliers based on quantiles for selected variables
+for (i in 1:3) {
+  Q <- quantile(XY[, i], probs = c(.05, .95), na.rm = TRUE)
+  XY <- subset(XY, Q[1] < XY[, i] & XY[, i] < Q[2])
+}
+
+# Convert matrix to data frame and separate response and predictor variables
+XY <- as.data.frame(XY)
+Crashes <- XY %>% select(KA, B, C, PDO) %>% as.matrix()
+X <- XY[, 1:3] %>% as.matrix()
+
+# Get dimensions for further analysis
+K <- dim(X)[2]  # Number of predictor variables
+J <- dim(Crashes)[2]  # Number of crash severity types
+N <- dim(Crashes)[1]  # Number of observations
+
+# Convert all predictor and response variables to numeric format
+X <- apply(X, 2, as.numeric)
+Crashes <- apply(Crashes, 2, as.numeric)
+```
+
+```{r}
+# JAGS model data and parameters
+# Define the model in JAGS using sink to create a model file
+sink("MVNBL_model.txt")
+cat("
+model { 
+    for (j in 1:J) {
+      for (i in 1:N) {
+        Crashes[i, j] ~ dnegbin(p[i, j], phi[j])
+        p[i, j] <- phi[j] / (phi[j] + mu_adjusted[i, j])
+        mu[i, j] <- exp(inprod(beta[j, ], X[i, ]) + beta_0[j])
+        mu_adjusted[i, j] <- mu[i, j] * eps[i, j]
+        d[i, j] ~ dgamma(gamma, 1)
+        ph1[i, j] <- c[j] + z[i, j] - gamma
+        eps_1[i, j] ~ dgamma(ph1[i, j], theta[j])
+        eps[i, j] <- eps_1[i, j] + gamma / theta[j]
+        ph2[i, j] <- c[j] / (c[j] + theta[j])
+        z[i, j] ~ dbern(ph2[i, j])
+        ll[i, j] <- logdensity.negbin(Crashes[i, j], p[i, j], phi[j])
+      }
+    }
+    
+    gamma_over_c ~ dunif(0, 1)
+    gamma <- min(c[]) * gamma_over_c
+    
+    for (j in 1:J) {
+      phi[j] ~ dunif(0, 10)
+      beta_0[j] ~ dnorm(0.01, 0.01)
+      c_over_theta[j] ~ dunif(0.1, 0.9)
+      theta_over_c[j] <- 1 / c_over_theta[j]
+      theta[j] <- theta_over_c[j] * c[j]
+      c[j] <- ifelse(theta_over_c[j] == 1, 1, 1 / (theta_over_c[j]^2 - 1))
+      
+      for (k in 1:K) {
+        beta[j, k] ~ dnorm(0.01, 0.01)
+      }
+    }
+}", fill = TRUE)
+sink()
+```
+
+```{r}
+# Prepare data and parameters for JAGS model
+# Define the data and parameters required for JAGS
+data_jags <- list(N = N, J = J, K = K, Crashes = Crashes, X = X)
+params <- c(
+  "beta", "phi", "mu", "beta_0", "theta", "c", "ll", "eps", 
+  "c_over_theta", "gamma", "gamma_over_c"
+)
+
+# MCMC settings for running the model
+nc <- 1      # Number of chains
+ni <- 100000 # Number of iterations
+nb <- 20000  # Number of burn-in samples
+nt <- 10     # Thinning rate
+
+# Run the model using JAGS
+Model <- jags(
+  data = data_jags,
+  parameters.to.save = params,
+  model.file = "MVNBL_model.txt",
+  n.chains = nc,
+  n.iter = ni,
+  n.burnin = nb,
+  n.thin = nt,
+  DIC = TRUE
+)
+
+# Save the model as an RDS file for future reference
+saveRDS(Model, "./MVNBWLindley_2.rds")
+```
