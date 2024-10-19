@@ -1,4 +1,4 @@
-# MVNBL_jags
+# Multivariate Negative Binomial Linldey uisng JAGS
 
 This repository contains the implementation of a Multivariate Negative Binomial Lindley (MVNBL) model using JAGS for Bayesian inference. The model is used for analyzing crash frquency & severity data from Michigan intersections. The workflow involves data preparation, model specification, and estimation using Markov Chain Monte Carlo (MCMC) methods in JAGS.
 
