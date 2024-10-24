@@ -168,5 +168,5 @@ Model <- jags(
 )
 
 # Save the model as an RDS file for future reference
-saveRDS(Model, "./MVNBWLindley_2.rds")
+saveRDS(Model, "./MVNBWLindley.rds")
 ```
